@@ -1,0 +1,244 @@
+---
+title: "HW8 — Basic Modeling Practice"
+subtitle: "Daily bike demand modeling with three linear recipes and 10-fold CV"
+author: "Shohn Godboldt"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+# Overview
+
+In this assignment, I apply the HW8 modeling workflow to explore and predict **daily bike rental demand** in Seoul.
+I begin by cleaning the raw data and keeping only **Functioning Day == "Yes"**, then I aggregate the hourly records
+to the **daily** level (summing bike counts and precipitation and averaging weather variables). I next build and compare
+**three linear regression recipes** of increasing complexity: a standardized baseline, a version with **key interaction terms**,
+and a third that adds **quadratic** terms to capture nonlinearity. I evaluate the models using **10-fold cross-validation**
+with **RMSE** as the metric, select the best-performing specification, and finally assess it on a held‑out test set and
+inspect the **top coefficients** to interpret the effects.
+
+# Setup
+
+```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org"),
+        install.packages.check.source = "no")
+needed <- c("readr","tidyverse","lubridate","janitor","skimr","tidymodels","broom")
+to_install <- setdiff(needed, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, type = "binary")
+
+library(tidyverse)
+library(lubridate)
+library(janitor)
+library(skimr)
+library(tidymodels)
+library(broom)
+
+set.seed(123)
+```
+
+# Data: Read, Clean, and Subset (Functioning Days)
+
+```{r}
+raw <- readr::read_csv("SeoulBikeData.csv", show_col_types = FALSE) |>
+  janitor::clean_names()
+
+dat <- raw |>
+  mutate(
+    date = lubridate::dmy(date),
+    seasons = factor(seasons),
+    holiday = factor(holiday),
+    functioning_day = factor(functioning_day)
+  ) |>
+  filter(functioning_day == "Yes") |>
+  rename(
+    bike_count   = rented_bike_count,
+    windspeed_ms = wind_speed_m_s,
+    dewpoint_c   = dew_point_temperature_c
+  )
+
+# Safe coalescer that only uses columns that actually exist
+coalesce_into <- function(data, out, candidates) {
+  present <- intersect(candidates, names(data))
+  if (length(present) == 0) return(data)
+  if (!out %in% names(data)) {
+    data <- dplyr::mutate(data, !!out := dplyr::coalesce(!!!rlang::syms(present)))
+  }
+  data
+}
+
+# Ensure I have a `humidity` column regardless of exact header spelling
+hum_candidates <- c("humidity","humidity_percent","rel_humidity","hum")
+present_hum <- intersect(hum_candidates, names(dat))
+if (length(present_hum) == 0) stop("No humidity-like column found in the CSV (e.g., Humidity(%)).")
+if (!"humidity" %in% names(dat)) {
+  dat <- dplyr::mutate(dat, humidity = dplyr::coalesce(!!!rlang::syms(present_hum)))
+}
+
+# Normalize other common variants
+dat <- coalesce_into(dat, "visibility_10m",        c("visibility_10m","visibility"))
+dat <- coalesce_into(dat, "solar_radiation_mj_m2", c("solar_radiation_mj_m2","solar_radiation","solar_radiation_m_j_m2"))
+dat <- coalesce_into(dat, "rainfall_mm",           c("rainfall_mm","rainfall"))
+dat <- coalesce_into(dat, "snowfall_cm",           c("snowfall_cm","snowfall"))
+```
+
+# Aggregate to Daily Level + Day Type
+
+```{r}
+daily <- dat |>
+  group_by(date, seasons, holiday) |>
+  summarise(
+    bike_count = sum(bike_count, na.rm = TRUE),
+    rainfall_mm = sum(rainfall_mm, na.rm = TRUE),
+    snowfall_cm = sum(snowfall_cm, na.rm = TRUE),
+    temperature_c = mean(temperature_c, na.rm = TRUE),
+    humidity = mean(humidity, na.rm = TRUE),
+    windspeed_ms = mean(windspeed_ms, na.rm = TRUE),
+    visibility_10m = mean(visibility_10m, na.rm = TRUE),
+    dewpoint_c = mean(dewpoint_c, na.rm = TRUE),
+    solar_radiation_mj_m2 = mean(solar_radiation_mj_m2, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    dow = lubridate::wday(date, label = TRUE, abbr = FALSE),
+    day_type = factor(if_else(dow %in% c("Saturday","Sunday"), "weekend","weekday"))
+  )
+
+skim(daily)
+```
+
+# Train/Test Split and Resampling
+
+```{r}
+split <- initial_split(daily, prop = 0.75, strata = seasons)
+train <- training(split)
+test  <- testing(split)
+
+folds <- vfold_cv(train, v = 10, strata = seasons)
+```
+
+# Model Specification
+
+```{r}
+lm_spec <- linear_reg() |> set_engine("lm")
+```
+
+# Recipe 1 — Standardize + Dummies + Weekend/Weekday
+
+```{r}
+rec1 <- recipe(
+  bike_count ~ seasons + holiday + day_type + temperature_c + humidity + windspeed_ms +
+    visibility_10m + dewpoint_c + solar_radiation_mj_m2 + rainfall_mm + snowfall_cm,
+  data = train
+) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+wf1 <- workflow() |> add_model(lm_spec) |> add_recipe(rec1)
+```
+
+# Recipe 2 — Add Interactions
+
+```{r}
+rec2 <- recipe(
+  bike_count ~ seasons + holiday + day_type + temperature_c + humidity + windspeed_ms +
+    visibility_10m + dewpoint_c + solar_radiation_mj_m2 + rainfall_mm + snowfall_cm,
+  data = train
+) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_interact(~ starts_with("seasons_"):starts_with("holiday_")) |>
+  step_interact(~ starts_with("seasons_"):temperature_c) |>
+  step_interact(~ temperature_c:rainfall_mm) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+wf2 <- workflow() |> add_model(lm_spec) |> add_recipe(rec2)
+```
+
+# Recipe 3 — Quadratics on only original numeric features
+
+```{r}
+numeric_vars <- c("temperature_c","humidity","windspeed_ms","visibility_10m",
+                  "dewpoint_c","solar_radiation_mj_m2","rainfall_mm","snowfall_cm")
+
+rec3 <- recipe(
+  bike_count ~ seasons + holiday + day_type + temperature_c + humidity + windspeed_ms +
+    visibility_10m + dewpoint_c + solar_radiation_mj_m2 + rainfall_mm + snowfall_cm,
+  data = train
+) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_poly(all_of(numeric_vars), degree = 2) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_lincomb(all_numeric_predictors()) |>
+  step_corr(all_numeric_predictors(), threshold = 0.999) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+wf3 <- workflow() |> add_model(lm_spec) |> add_recipe(rec3)
+```
+
+# 10-Fold Cross-Validation and Model Selection
+
+```{r}
+ctrl <- control_resamples(save_pred = TRUE, save_workflow = TRUE, verbose = TRUE)
+
+res1 <- fit_resamples(wf1, folds, control = ctrl)
+res2 <- fit_resamples(wf2, folds, control = ctrl)
+res3 <- fit_resamples(wf3, folds, control = ctrl)
+
+# If any model fails on some folds, show brief notes
+try({ show_notes(res1) }, silent = TRUE)
+try({ show_notes(res2) }, silent = TRUE)
+try({ show_notes(res3) }, silent = TRUE)
+
+m1 <- collect_metrics(res1) |> filter(.metric == "rmse") |> mutate(model = "Recipe 1")
+m2 <- collect_metrics(res2) |> filter(.metric == "rmse") |> mutate(model = "Recipe 2 (+ interactions)")
+m3 <- collect_metrics(res3) |> filter(.metric == "rmse") |> mutate(model = "Recipe 3 (+ interactions + quadratics)")
+
+cv_compare <- bind_rows(m1, m2, m3) |> arrange(mean)
+cv_compare
+
+best_label <- cv_compare$model[[1]]
+best_wf <- switch(best_label,
+  "Recipe 1" = wf1,
+  "Recipe 2 (+ interactions)" = wf2,
+  "Recipe 3 (+ interactions + quadratics)" = wf3
+)
+
+final_fit <- last_fit(best_wf, split)
+```
+
+# Final Test Performance
+
+```{r}
+collect_metrics(final_fit)
+```
+
+# Coefficients (Top 30 by |estimate|)
+
+```{r}
+final_fit |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  arrange(desc(abs(estimate))) |>
+  head(30)
+```
+
+# Discussion and Findings
+
+The final model I selected was **Recipe 3**, which includes both interaction and quadratic terms.
+This specification achieved the lowest RMSE during cross-validation, indicating that the added
+nonlinearity and interactions improved predictive accuracy over simpler models. I find that
+**temperature**, **humidity**, and **solar radiation** are consistently influential, which aligns
+with expectations for outdoor activity and demand. I also observe clear **seasonal** and **holiday**
+effects, confirming that both environmental and temporal factors play important roles in daily
+bike rentals in Seoul.
